@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,7 +11,51 @@ from dotenv import load_dotenv
 # database connections.
 load_dotenv()
 
-from analyze_staging import analyze, connect_db  # noqa: E402
+from analyze_staging import analyze, connect_db, nonblank  # noqa: E402
+import bootstrap_normalized as bootstrap_module  # noqa: E402
+
+
+def parse_google_export_date(value) -> date | None:
+    """Accept date-only and datetime-shaped values emitted by Google CSV exports."""
+    text = nonblank(value)
+    if not text:
+        return None
+
+    # Google's CSV export commonly emits midnight timestamps such as
+    # 2026-04-12 00:00:00 even when the Sheet cell is conceptually a date.
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m-%d-%Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+
+    # Also accept ISO 8601 values with timezone offsets or a trailing Z.
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(iso_text).date()
+    except ValueError as exc:
+        raise ValueError(f"Unrecognized date value: {value!r}") from exc
+
+
+# Patch the shared migration module before importing parity_check. apply_bootstrap
+# resolves parse_date from bootstrap_normalized at runtime, and parity_check imports
+# the same function below, so both code paths use the exact same robust parser.
+bootstrap_module.parse_date = parse_google_export_date
+
 from bootstrap_normalized import (  # noqa: E402
     DEFAULT_LEAGUE_NAME,
     apply_bootstrap,
