@@ -26,6 +26,11 @@ CREATE TABLE IF NOT EXISTS sham_pool_round_stats (
   UNIQUE (season_id, legacy_round_no, pool)
 );
 
+-- v_aces depends on ace_awards.payout. PostgreSQL will not permit changing the
+-- payout column type while the view exists, so drop the compatibility view
+-- before altering ace_awards and recreate it below in the same transaction.
+DROP VIEW IF EXISTS v_aces;
+
 -- Existing all-time aces can predate the current workbook. Allow a historical
 -- ace to identify the player/layout/date directly without fabricating a round.
 -- Legacy BirdBrain could split a multiple-ace pot fractionally, so preserve the
@@ -57,8 +62,6 @@ ALTER TABLE course_records ALTER COLUMN round_id DROP NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_historical_course_record
   ON course_records(layout_id, player_id, achieved_on, score)
   WHERE round_id IS NULL;
-
-DROP VIEW IF EXISTS v_aces;
 
 CREATE VIEW v_aces AS
 SELECT
