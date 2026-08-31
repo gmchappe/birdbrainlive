@@ -1,75 +1,131 @@
 # BirdBrain migration utilities
 
-These scripts are for the one-time/staged migration from the live Google Sheets workbook to the development PostgreSQL database.
+These scripts perform the staged migration from the ongoing read-only Google Sheets workbook to the BirdBrain development PostgreSQL database.
 
 They do **not** modify the Google Sheet.
 
-## 1. Create a read-only snapshot
+## Local setup
 
-From the repository root:
+From the repository root, create the virtual environment if you have not already:
 
-```bash
-python -m venv .venv
+```powershell
+py -m venv .venv
 ```
 
-Activate the environment, then install the database dependency:
+Install/update dependencies:
 
-```bash
-pip install -r python/requirements.txt
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r python\requirements.txt
 ```
 
-Create the snapshot:
+Copy the safe example configuration:
 
-```bash
-python python/birdbrain_migrate/snapshot_google.py
+```powershell
+Copy-Item .env.example .env
 ```
 
-The script reads the public workbook through Google's CSV export endpoint and creates:
+Open `.env` locally and replace the placeholder with the PostgreSQL URI shown by Supabase's **Connect** dialog for the BirdBrain **development** project. `.env` is gitignored and must never be committed.
+
+## Migration CLI
+
+All database migration operations should now use:
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\cli.py <command>
+```
+
+The CLI loads `.env` automatically.
+
+### 1. Capture the live Sheet read-only
+
+The snapshot utility is deliberately separate because it does not need database credentials:
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\snapshot_google.py
+```
+
+It uses Google's GET-only CSV export endpoint and writes a timestamped folder under `data/snapshots/`. That directory is gitignored.
+
+### 2. Load the newest snapshot into private staging
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\cli.py load-staging
+```
+
+The loader verifies SHA-256 hashes and writes only to `migration_staging`. It refuses to load the identical captured snapshot twice.
+
+### 3. Validate the staged source contract
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\cli.py analyze
+```
+
+This validates:
+
+- required sheet/header contracts;
+- schedule-to-score-history round column mapping;
+- schedule-to-handicap-history mapping;
+- duplicate player identities in authoritative sheets;
+- current roster/history count diagnostics.
+
+No normalized tables are changed. A detailed JSON report is written to the gitignored `data/reports/` directory.
+
+### 4. Preview the normalized bootstrap
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\cli.py bootstrap
+```
+
+Dry-run is the default. It reports the number of players, rounds, historical results, handicap adjustments, records, aces, etc. that would be imported.
+
+The current Leaderboard is intentionally preserved as a migration baseline through the latest completed round. Detailed historical gross-score and handicap facts are imported, but the migration does not fabricate missing historical playoff-resolution detail.
+
+### 5. Apply the normalized bootstrap
+
+Only after the analysis and dry-run are clean:
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\cli.py bootstrap --apply
+```
+
+The bootstrap is one-shot and transaction-protected. It refuses to merge into a target where normalized league rows already exist.
+
+### 6. Prove public-output parity
+
+```powershell
+.\.venv\Scripts\python.exe python\birdbrain_migrate\cli.py parity
+```
+
+This compares PostgreSQL compatibility views against the exact staged Google snapshot for:
+
+- League Schedule
+- Leaderboard
+- Current All Time
+- Course Records
+- Aces
+- Hall of Champions
+
+The Shiny development app should not be wired to PostgreSQL until all six checks pass.
+
+## Migration architecture
 
 ```text
-data/snapshots/<UTC timestamp>/
-    manifest.json
-    League_Schedule.csv
-    Leaderboard.csv
-    ...
+Live Google Sheet (read-only)
+        |
+        v
+local timestamped snapshot
+        |
+        v
+migration_staging (exact rows)
+        |
+        v
+normalized BirdBrain tables
+        |
+        v
+compatibility views
+        |
+        v
+parity check against source snapshot
 ```
 
-`data/snapshots/` is intentionally gitignored. Live-season snapshots should not be committed to the public repository.
-
-## 2. Load the exact snapshot into PostgreSQL staging
-
-Before loading, apply the staging migration in `supabase/migrations/` and set database environment variables locally.
-
-Preferred variables:
-
-```text
-BB_DB_HOST
-BB_DB_PORT
-BB_DB_NAME
-BB_DB_USER
-BB_DB_PASSWORD
-BB_DB_SSLMODE
-```
-
-Alternatively, set one private `BB_DATABASE_URL` connection string.
-
-Never commit any of those values.
-
-Then run:
-
-```bash
-python python/birdbrain_migrate/load_staging.py data/snapshots/<UTC timestamp>
-```
-
-The loader verifies every file's SHA-256 hash, then inserts the unchanged source rows into the private `migration_staging` schema. It does not write to normalized BirdBrain application tables.
-
-## Why staging first?
-
-Google Sheets is the current production source during the ongoing season. Before translating it into normalized PostgreSQL records, BirdBrain stores an exact source snapshot so that:
-
-- the migration can be reproduced;
-- row/column mappings can be audited;
-- parity errors can be traced back to exact source values;
-- no migration script needs to alter the live workbook.
-
-The next migration step is a deterministic transformer from one `snapshot_id` into the normalized BirdBrain tables.
+This separation keeps the ongoing season safe and makes every transformation auditable.
