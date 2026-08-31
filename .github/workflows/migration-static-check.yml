@@ -1,0 +1,20 @@
+name: Migration static check
+
+on:
+  push:
+    branches: [legacy-R]
+  pull_request:
+    branches: [legacy-R]
+
+jobs:
+  python-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install migration dependencies
+        run: python -m pip install -r python/requirements.txt
+      - name: Compile migration utilities
+        run: python -m compileall -q python/birdbrain_migrate
