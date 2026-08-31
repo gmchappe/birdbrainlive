@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import argparse
 
-from analyze_staging import analyze, connect_db
+from dotenv import load_dotenv
+
+# Keep CLI behavior consistent with the bootstrap utilities: local database
+# credentials live in the repository-root .env and are never committed.
+load_dotenv()
+
+from analyze_staging import analyze, connect_db  # noqa: E402
 
 
 def find_past_unplayed_rounds(snapshot_id: int | None) -> tuple[int, list[tuple[int, str, str]]]:
