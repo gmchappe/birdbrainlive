@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from analyze_staging import (
+    analyze,
     connect_db,
     get_sheet_metadata,
     get_sheet_rows,
@@ -16,6 +17,7 @@ from analyze_staging import (
     parse_int,
 )
 from bootstrap_normalized import parse_date, parse_decimal
+from source_normalization import normalize_rows_for_bootstrap
 
 REPORT_ROOT = Path("data/reports")
 
@@ -78,7 +80,6 @@ def canonical_decimal(value: Any) -> str:
     if number is None:
         return ""
     normalized = number.normalize()
-    # Decimal('0E-2') should compare as 0.
     if normalized == 0:
         return "0"
     return format(normalized, "f")
@@ -91,8 +92,6 @@ def canonical_integer(value: Any) -> str:
         return str(value)
     parsed = parse_int(value)
     if parsed is None:
-        # Course-record Score is an integer, but Hall Score is intentionally text;
-        # only fields routed here should be numeric.
         raise ValueError(f"Expected integer-compatible value, got {value!r}")
     return str(parsed)
 
@@ -102,7 +101,6 @@ def canonical_row(sheet: str, row: dict[str, Any], columns: list[str]) -> tuple[
     for column in columns:
         value = row.get(column)
         if sheet == "League Schedule" and column == "Date":
-            # This is a display label (e.g. Apr 12), not a typed date.
             result.append(canonical_text(value))
         elif column in DATE_FIELDS:
             result.append(canonical_date(value))
@@ -139,21 +137,32 @@ def multiset_diff(
 
 
 def run_parity(snapshot_id: int | None) -> dict[str, Any]:
+    analysis = analyze(snapshot_id)
+    if not analysis["ready_for_transform"]:
+        raise RuntimeError("Cannot run parity against a staging snapshot with blocking errors.")
+    snapshot_id = int(analysis["snapshot_id"])
+
     conn = connect_db()
     try:
         with conn.cursor() as cur:
-            snapshot_id = snapshot_id or latest_snapshot_id(cur)
             metadata = get_sheet_metadata(cur, snapshot_id)
+            raw_source = {
+                sheet: get_sheet_rows(cur, snapshot_id, sheet, meta["headers"])
+                for sheet, meta in metadata.items()
+            }
+            source = normalize_rows_for_bootstrap(analysis, raw_source)
+
             report: dict[str, Any] = {
                 "snapshot_id": snapshot_id,
+                "source_mode": "canonicalized_staged_snapshot",
+                "identity_merges": analysis.get("identity_merges", {}),
                 "checks": {},
                 "all_passed": True,
             }
 
             for sheet, spec in VIEW_SPECS.items():
                 columns = spec["columns"]
-                headers = metadata[sheet]["headers"]
-                source_dicts = get_sheet_rows(cur, snapshot_id, sheet, headers)
+                source_dicts = source.get(sheet, [])
                 db_dicts = fetch_view_rows(cur, spec["view"], columns)
 
                 source_rows = sorted(canonical_row(sheet, row, columns) for row in source_dicts)
@@ -180,7 +189,10 @@ def run_parity(snapshot_id: int | None) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare normalized BirdBrain compatibility views with a staged Google snapshot."
+        description=(
+            "Compare normalized BirdBrain compatibility views with the canonicalized "
+            "staged Google snapshot."
+        )
     )
     parser.add_argument("--snapshot-id", type=int)
     parser.add_argument("--report-root", type=Path, default=REPORT_ROOT)
@@ -195,6 +207,7 @@ def main() -> None:
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print(f"Parity check for snapshot_id={report['snapshot_id']}")
+    print(f"Source mode: {report['source_mode']}")
     for sheet, result in report["checks"].items():
         state = "PASS" if result["passed"] else "FAIL"
         print(
@@ -206,7 +219,7 @@ def main() -> None:
     print(f"\nFull report: {report_path}")
     if not report["all_passed"]:
         raise SystemExit(2)
-    print("All public compatibility views match the staged Google Sheet snapshot.")
+    print("All public compatibility views match the canonicalized staged snapshot.")
 
 
 if __name__ == "__main__":
