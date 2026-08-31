@@ -9,4 +9,5 @@
 __pycache__/
 .venv/
 data/snapshots/
+data/reports/
 .DS_Store
