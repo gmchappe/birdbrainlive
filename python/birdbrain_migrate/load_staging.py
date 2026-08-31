@@ -10,6 +10,8 @@ from pathlib import Path
 import psycopg
 from psycopg.types.json import Jsonb
 
+DEFAULT_SNAPSHOT_ROOT = Path("data/snapshots")
+
 
 def connect_db() -> psycopg.Connection:
     database_url = os.getenv("BB_DATABASE_URL")
@@ -46,7 +48,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def resolve_manifest(path: Path) -> Path:
+def latest_snapshot(root: Path = DEFAULT_SNAPSHOT_ROOT) -> Path:
+    if not root.exists():
+        raise FileNotFoundError(f"Snapshot root not found: {root}")
+    candidates = sorted(
+        (path for path in root.iterdir() if path.is_dir() and (path / "manifest.json").exists()),
+        key=lambda path: path.name,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No snapshots with manifest.json found under {root}")
+    return candidates[-1]
+
+
+def resolve_manifest(path: Path | None) -> Path:
+    if path is None:
+        path = latest_snapshot()
     if path.is_dir():
         path = path / "manifest.json"
     if not path.exists():
@@ -54,7 +70,7 @@ def resolve_manifest(path: Path) -> Path:
     return path
 
 
-def load_snapshot(manifest_path: Path) -> int:
+def load_snapshot(manifest_path: Path | None) -> int:
     manifest_path = resolve_manifest(manifest_path)
     snapshot_dir = manifest_path.parent
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -70,6 +86,21 @@ def load_snapshot(manifest_path: Path) -> int:
     try:
         with conn.transaction():
             with conn.cursor() as cur:
+                # Loading the same captured snapshot twice is almost certainly accidental.
+                cur.execute(
+                    """
+                    SELECT snapshot_id
+                    FROM migration_staging.snapshots
+                    WHERE spreadsheet_id = %s AND captured_at = %s
+                    """,
+                    (manifest["spreadsheet_id"], manifest["captured_at"]),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    raise RuntimeError(
+                        f"This snapshot is already loaded as snapshot_id={existing[0]}."
+                    )
+
                 cur.execute(
                     """
                     INSERT INTO migration_staging.snapshots
@@ -149,6 +180,7 @@ def load_snapshot(manifest_path: Path) -> int:
                         ],
                     )
 
+        print(f"Source snapshot: {snapshot_dir}")
         return snapshot_id
     finally:
         conn.close()
@@ -160,8 +192,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "snapshot",
+        nargs="?",
         type=Path,
-        help="Snapshot directory or manifest.json path.",
+        help=(
+            "Snapshot directory or manifest.json path. If omitted, the newest "
+            "snapshot under data/snapshots is used."
+        ),
     )
     return parser.parse_args()
 
