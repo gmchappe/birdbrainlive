@@ -281,9 +281,14 @@ def _normalize_poolwise(report: dict[str, Any], rows: list[dict[str, str]]) -> l
     result: list[dict[str, str]] = []
     for source in rows:
         row = dict(source)
-        row["LegacyRdNo"] = nonblank(row.get("RdNo"))
-        if nonblank(row.get("RoundNo")):
-            row["RdNo"] = nonblank(row.get("RoundNo"))
+        # IMPORTANT legacy semantics:
+        #   RdNo    = monotonically increasing all-time SHAM observation sequence.
+        #   RoundNo = round number within that historical season.
+        # Earlier migration code overwrote RdNo with RoundNo, which collapsed
+        # unrelated seasons onto the same apparent round. Preserve both exactly;
+        # neither is a relational key in PostgreSQL.
+        row["RdNo"] = nonblank(row.get("RdNo"))
+        row["RoundNo"] = nonblank(row.get("RoundNo"))
         row["ParStrokes"] = nonblank(row.get("totalpar"))
         row["Avg"] = ""
         row["StdDev"] = ""
