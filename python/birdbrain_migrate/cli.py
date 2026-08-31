@@ -19,6 +19,7 @@ from bootstrap_normalized import (  # noqa: E402
 )
 from load_staging import load_snapshot  # noqa: E402
 from parity_check import run_parity  # noqa: E402
+from source_normalization import normalize_rows_for_bootstrap  # noqa: E402
 
 REPORT_ROOT = Path("data/reports")
 
@@ -42,6 +43,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     print(f"Snapshot ID: {report['snapshot_id']}")
     print(f"Captured: {report['captured_at']}")
     print(f"Completed score-history rounds: {report['completed_round_count']}")
+    print(f"Pool history schema: {report.get('poolwise_schema_variant')}")
     counts = report["player_counts"]
     print(
         "Players: "
@@ -54,9 +56,14 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     for mapping in report["round_mappings"]:
         state = "SCORED" if mapping["has_season_score_column"] else "scheduled"
         hcp = "hcp=yes" if mapping["has_handicap_adjustment_column"] else "hcp=no"
-        print(f"  R{mapping['round_no']:>2}: {mapping['legacy_column']} [{state}, {hcp}]")
+        actual = mapping.get("season_score_column")
+        suffix = "" if not actual or actual == mapping["legacy_column"] else f" -> {actual}"
+        print(
+            f"  R{mapping['round_no']:>2}: {mapping['legacy_column']}{suffix} "
+            f"[{state}, {hcp}]"
+        )
     if report["warnings"]:
-        print("\nWarnings:")
+        print("\nWarnings / planned normalizations:")
         for warning in report["warnings"]:
             print(f"  - {warning}")
     if report["hard_errors"]:
@@ -77,12 +84,19 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db()
     try:
         with conn.cursor() as cur:
-            rows = get_snapshot_rows(cur, snapshot_id)
+            source_rows = get_snapshot_rows(cur, snapshot_id)
     finally:
         conn.close()
+
+    rows = normalize_rows_for_bootstrap(report, source_rows)
     summary = plan_summary(report, rows)
+    summary["identity_merges"] = sum(
+        len(groups) for groups in report.get("identity_merges", {}).values()
+    )
+    summary["poolwise_schema"] = report.get("poolwise_schema_variant")
+
     print(f"Snapshot ID: {snapshot_id}")
-    print("Bootstrap plan:")
+    print("Bootstrap plan (after deterministic source normalization):")
     for key, value in summary.items():
         print(f"  {key}: {value}")
     if not args.apply:
