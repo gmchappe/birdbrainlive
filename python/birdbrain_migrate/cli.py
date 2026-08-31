@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import json
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -76,6 +77,56 @@ def write_report(prefix: str, snapshot_id: int, payload: dict) -> Path:
     path = REPORT_ROOT / f"{prefix}_snapshot_{snapshot_id}.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
+
+
+def fill_unambiguous_schedule_layout_metadata(rows: dict) -> list[dict]:
+    """Fill missing schedule layout metadata only from the same known layout.
+
+    Cancelled legacy rounds can have partially blank schedule rows. For each exact
+    Course + Layout pair, a missing Par/ParFours/ParFives value may be copied only
+    when every nonblank occurrence of that field elsewhere in the schedule agrees
+    on one value. Conflicting layout history is left untouched and will still fail
+    downstream rather than being guessed.
+    """
+    schedule = rows.get("League Schedule", [])
+    known: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
+        lambda: {"Par": set(), "ParFours": set(), "ParFives": set()}
+    )
+
+    for row in schedule:
+        key = (nonblank(row.get("Course")), nonblank(row.get("Layout")))
+        if not all(key):
+            continue
+        for field in ("Par", "ParFours", "ParFives"):
+            value = nonblank(row.get(field))
+            if value:
+                known[key][field].add(value)
+
+    changes: list[dict] = []
+    for row in schedule:
+        key = (nonblank(row.get("Course")), nonblank(row.get("Layout")))
+        if not all(key):
+            continue
+        round_no = bootstrap_module.decimal_int(row.get("RoundNo"))
+        filled: dict[str, str] = {}
+        for field in ("Par", "ParFours", "ParFives"):
+            if nonblank(row.get(field)):
+                continue
+            candidates = known[key][field]
+            if len(candidates) == 1:
+                value = next(iter(candidates))
+                row[field] = value
+                filled[field] = value
+        if filled:
+            changes.append(
+                {
+                    "round_no": round_no,
+                    "course": key[0],
+                    "layout": key[1],
+                    "filled": filled,
+                }
+            )
+    return changes
 
 
 def unresolved_layout_hole_rows(rows: dict) -> list[dict]:
@@ -217,18 +268,28 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         conn.close()
 
     rows = normalize_rows_for_bootstrap(report, source_rows)
+    metadata_fills = fill_unambiguous_schedule_layout_metadata(rows)
     unresolved_holes = unresolved_layout_hole_rows(rows)
     summary = plan_summary(report, rows)
     summary["identity_merges"] = sum(
         len(groups) for groups in report.get("identity_merges", {}).values()
     )
     summary["poolwise_schema"] = report.get("poolwise_schema_variant")
+    summary["schedule_metadata_fills"] = len(metadata_fills)
     summary["unresolved_hole_par_rounds"] = len(unresolved_holes)
 
     print(f"Snapshot ID: {snapshot_id}")
     print("Bootstrap plan (after deterministic source normalization):")
     for key, value in summary.items():
         print(f"  {key}: {value}")
+
+    if metadata_fills:
+        print("\nSchedule metadata recovered from identical Course + Layout rows:")
+        for item in metadata_fills:
+            fields = ", ".join(f"{key}={value!r}" for key, value in item["filled"].items())
+            print(
+                f"  R{item['round_no']}: {item['course']} - {item['layout']} <- {fields}"
+            )
 
     if unresolved_holes:
         print("\nUnresolved legacy hole-level par metadata:")
