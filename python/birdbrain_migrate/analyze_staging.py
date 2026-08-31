@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,16 +24,18 @@ STATIC_REQUIRED_HEADERS: dict[str, list[str]] = {
         "GM", "Rating", "Slope", "StdSlope", "Weight",
     ],
     "Player Pool Assignments": ["Name", "Pool"],
-    "Poolwise Strokes by Round": [
-        "RdNo", "Course", "Layout", "Par", "Pool", "Players", "Strokes",
-        "Avg", "StdDev", "ParStrokes",
-    ],
     "Past All Time": ["Name", "Points", "Rounds", "Season"],
     "Current All Time": ["Name", "Seasons", "Rounds", "Points", "milestonen"],
     "Aces": ["Name", "Date", "Course", "Layout", "Hole", "Payout"],
     "Course Records": ["Course", "Layout", "Name", "Score", "Date"],
     "Hall of Champions": ["Event", "Year", "Division", "Name", "Score"],
 }
+
+POOLWISE_BASE_HEADERS = [
+    "Course", "Layout", "RdNo", "Par", "Pool", "Players", "Strokes"
+]
+POOLWISE_MODERN_HEADERS = ["Avg", "StdDev", "ParStrokes"]
+POOLWISE_LEGACY_HEADERS = ["totalpar", "RoundNo"]
 
 
 def connect_db() -> psycopg.Connection:
@@ -67,6 +70,21 @@ def nonblank(value: Any) -> str:
 
 def legacy_round_column(course: str, date_label: str) -> str:
     return f"{nonblank(course)}_{nonblank(date_label)}".replace(" ", "_")
+
+
+def canonical_round_header(value: str) -> str:
+    """Treat punctuation-only differences in legacy dynamic headers as equivalent."""
+    return re.sub(r"[^a-z0-9]+", "_", nonblank(value).casefold()).strip("_")
+
+
+def resolve_round_header(expected: str, headers: list[str]) -> tuple[str | None, list[str]]:
+    if expected in headers:
+        return expected, []
+    key = canonical_round_header(expected)
+    matches = [h for h in headers if canonical_round_header(h) == key]
+    if len(matches) == 1:
+        return matches[0], matches
+    return None, matches
 
 
 def parse_int(value: Any) -> int | None:
@@ -139,20 +157,39 @@ def get_sheet_rows(
     return result
 
 
-def duplicate_names(rows: list[dict[str, str]]) -> list[str]:
-    seen: dict[str, str] = {}
-    duplicates: set[str] = set()
+def identity_groups(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    groups: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         display = nonblank(row.get("Name"))
-        if not display:
+        if display:
+            groups[normalized_name(display)].append(row)
+    return groups
+
+
+def duplicate_identity_details(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for key, group in identity_groups(rows).items():
+        if len(group) < 2:
             continue
-        key = normalized_name(display)
-        if key in seen:
-            duplicates.add(display)
-            duplicates.add(seen[key])
-        else:
-            seen[key] = display
-    return sorted(duplicates, key=str.casefold)
+        details.append(
+            {
+                "normalized_name": key,
+                "variants": sorted({nonblank(row.get("Name")) for row in group}, key=str.casefold),
+                "rows": group,
+            }
+        )
+    return details
+
+
+def conflicting_values(
+    rows: list[dict[str, str]], columns: list[str]
+) -> dict[str, list[str]]:
+    conflicts: dict[str, list[str]] = {}
+    for column in columns:
+        values = sorted({nonblank(row.get(column)) for row in rows if nonblank(row.get(column))})
+        if len(values) > 1:
+            conflicts[column] = values
+    return conflicts
 
 
 def analyze(snapshot_id: int | None) -> dict[str, Any]:
@@ -188,6 +225,33 @@ def analyze(snapshot_id: int | None) -> dict[str, Any]:
                         f"actual={meta['headers']}"
                     )
 
+            poolwise_variant: str | None = None
+            pool_meta = sheets.get("Poolwise Strokes by Round")
+            if not pool_meta:
+                hard_errors.append("Missing required sheet: Poolwise Strokes by Round")
+            else:
+                headers = pool_meta["headers"]
+                missing_base = [h for h in POOLWISE_BASE_HEADERS if h not in headers]
+                if missing_base:
+                    hard_errors.append(
+                        "Poolwise Strokes by Round: missing base headers "
+                        f"{missing_base}; actual={headers}"
+                    )
+                elif all(h in headers for h in POOLWISE_MODERN_HEADERS):
+                    poolwise_variant = "modern"
+                elif all(h in headers for h in POOLWISE_LEGACY_HEADERS):
+                    poolwise_variant = "legacy_live"
+                    warnings.append(
+                        "Poolwise Strokes by Round uses the live legacy SHAM schema "
+                        "(totalpar/RoundNo). totalpar will map to par_strokes; Avg and "
+                        "StdDev are not present and will remain NULL."
+                    )
+                else:
+                    hard_errors.append(
+                        "Poolwise Strokes by Round is neither the modern nor known live "
+                        f"legacy schema; actual={headers}"
+                    )
+
             handicap_meta = sheets.get("Handicap")
             if not handicap_meta:
                 hard_errors.append("Missing required sheet: Handicap")
@@ -218,34 +282,50 @@ def analyze(snapshot_id: int | None) -> dict[str, Any]:
                     cur, snapshot_id, sheet_name, sheets[sheet_name]["headers"]
                 )
 
-            for sheet_name in [
-                "Leaderboard", "Handicap", "Full Season Scores", "Past All Time",
-                "Current All Time", "Aces", "Course Records", "Hall of Champions",
-            ]:
-                rows = rows_by_sheet.get(sheet_name, [])
-                if "Name" not in sheets.get(sheet_name, {}).get("headers", []):
-                    continue
-                duplicates = duplicate_names(rows)
-                # Multiple Aces/Records/Championships by the same player are legitimate.
-                if duplicates and sheet_name in {
-                    "Leaderboard", "Handicap", "Full Season Scores", "Current All Time"
-                }:
-                    hard_errors.append(
-                        f"{sheet_name}: duplicate case-insensitive player names: {duplicates}"
-                    )
-
             schedule_rows = rows_by_sheet.get("League Schedule", [])
             score_headers = sheets.get("Full Season Scores", {}).get("headers", [])
             handicap_headers = sheets.get("Handicap", {}).get("headers", [])
 
             round_mappings: list[dict[str, Any]] = []
+            used_score_columns: set[str] = set()
+            used_handicap_columns: set[str] = set()
+            expected_header_groups: dict[str, list[int]] = defaultdict(list)
+
             for row in schedule_rows:
                 round_no = parse_int(row.get("RoundNo"))
                 if round_no is None:
                     continue
                 expected_column = legacy_round_column(row.get("Course", ""), row.get("Date", ""))
-                score_match = expected_column in score_headers
-                handicap_match = expected_column in handicap_headers
+                expected_header_groups[canonical_round_header(expected_column)].append(round_no)
+                score_column, score_matches = resolve_round_header(expected_column, score_headers)
+                handicap_column, handicap_matches = resolve_round_header(expected_column, handicap_headers)
+
+                if len(score_matches) > 1:
+                    hard_errors.append(
+                        f"Round {round_no}: score header {expected_column!r} has ambiguous "
+                        f"punctuation-normalized matches {score_matches}."
+                    )
+                if len(handicap_matches) > 1:
+                    hard_errors.append(
+                        f"Round {round_no}: handicap header {expected_column!r} has ambiguous "
+                        f"punctuation-normalized matches {handicap_matches}."
+                    )
+
+                if score_column:
+                    used_score_columns.add(score_column)
+                    if score_column != expected_column:
+                        warnings.append(
+                            f"Round {round_no} score column {score_column!r} matched schedule "
+                            f"column {expected_column!r} after punctuation normalization."
+                        )
+                if handicap_column:
+                    used_handicap_columns.add(handicap_column)
+                    if handicap_column != expected_column:
+                        warnings.append(
+                            f"Round {round_no} handicap column {handicap_column!r} matched schedule "
+                            f"column {expected_column!r} after punctuation normalization."
+                        )
+
                 round_mappings.append(
                     {
                         "round_no": round_no,
@@ -254,22 +334,29 @@ def analyze(snapshot_id: int | None) -> dict[str, Any]:
                         "date": row.get("Datend", ""),
                         "date_label": row.get("Date", ""),
                         "legacy_column": expected_column,
-                        "has_season_score_column": score_match,
-                        "has_handicap_adjustment_column": handicap_match,
+                        "season_score_column": score_column,
+                        "handicap_adjustment_column": handicap_column,
+                        "has_season_score_column": score_column is not None,
+                        "has_handicap_adjustment_column": handicap_column is not None,
                     }
                 )
 
+            for key, round_numbers in expected_header_groups.items():
+                if len(round_numbers) > 1:
+                    warnings.append(
+                        f"Schedule rounds {round_numbers} share the same legacy Sheet column "
+                        f"identity {key!r}. PostgreSQL can distinguish them by round number, "
+                        "but the legacy Sheet cannot represent both with one unsuffixed header."
+                    )
+
             completed = [m for m in round_mappings if m["has_season_score_column"]]
             unmatched_score_columns = [
-                header
-                for header in score_headers[1:]
-                if header and header not in {m["legacy_column"] for m in round_mappings}
+                header for header in score_headers[1:]
+                if header and header not in used_score_columns
             ]
             unmatched_handicap_columns = [
-                header
-                for header in handicap_headers[1:]
-                if header not in {"Handicap"}
-                and header not in {m["legacy_column"] for m in round_mappings}
+                header for header in handicap_headers[1:]
+                if header != "Handicap" and header not in used_handicap_columns
             ]
 
             if unmatched_score_columns:
@@ -289,6 +376,47 @@ def analyze(snapshot_id: int | None) -> dict[str, Any]:
                         f"Round {mapping['round_no']} has gross scores but no matching "
                         f"Handicap history column {mapping['legacy_column']!r}."
                     )
+
+            identity_merges: dict[str, list[dict[str, Any]]] = {}
+            for sheet_name in ["Leaderboard", "Handicap", "Full Season Scores", "Current All Time"]:
+                rows = rows_by_sheet.get(sheet_name, [])
+                details = duplicate_identity_details(rows)
+                if not details:
+                    continue
+                identity_merges[sheet_name] = details
+                variants = [d["variants"] for d in details]
+
+                if sheet_name == "Leaderboard":
+                    warnings.append(
+                        f"Leaderboard has case/spacing aliases {variants}. They will be merged "
+                        "as one player identity and split Points/Rounds will be summed."
+                    )
+                elif sheet_name == "Current All Time":
+                    warnings.append(
+                        f"Current All Time has case/spacing aliases {variants}. It is a derived "
+                        "parity target; normalized all-time totals will be rebuilt from Past All "
+                        "Time plus the current-season migration baseline."
+                    )
+                else:
+                    dynamic_columns: list[str]
+                    if sheet_name == "Handicap":
+                        dynamic_columns = sorted(used_handicap_columns)
+                    else:
+                        dynamic_columns = sorted(used_score_columns)
+                    for detail in details:
+                        conflicts = conflicting_values(detail["rows"], dynamic_columns)
+                        if conflicts:
+                            hard_errors.append(
+                                f"{sheet_name}: aliases {detail['variants']} contain conflicting "
+                                f"values for the same round columns: {conflicts}"
+                            )
+                    if not any(
+                        conflicting_values(d["rows"], dynamic_columns) for d in details
+                    ):
+                        warnings.append(
+                            f"{sheet_name} has case/spacing aliases {variants}. Their nonconflicting "
+                            "round histories will be merged before bootstrap."
+                        )
 
             leaderboard_names = {
                 normalized_name(row.get("Name", ""))
@@ -333,6 +461,8 @@ def analyze(snapshot_id: int | None) -> dict[str, Any]:
                     }
                     for name, meta in sheets.items()
                 },
+                "poolwise_schema_variant": poolwise_variant,
+                "identity_merges": identity_merges,
                 "round_mappings": sorted(round_mappings, key=lambda x: x["round_no"]),
                 "completed_round_count": len(completed),
                 "player_counts": {
@@ -372,6 +502,7 @@ def main() -> None:
     print(f"Snapshot ID: {report['snapshot_id']}")
     print(f"Captured: {report['captured_at']}")
     print(f"Completed score-history rounds: {report['completed_round_count']}")
+    print(f"Pool history schema: {report['poolwise_schema_variant']}")
     counts = report["player_counts"]
     print(
         "Players: "
@@ -385,13 +516,15 @@ def main() -> None:
     for mapping in report["round_mappings"]:
         state = "SCORED" if mapping["has_season_score_column"] else "scheduled"
         handicap = "hcp=yes" if mapping["has_handicap_adjustment_column"] else "hcp=no"
+        actual = mapping.get("season_score_column")
+        suffix = "" if not actual or actual == mapping["legacy_column"] else f" -> {actual}"
         print(
-            f"  R{mapping['round_no']:>2}: {mapping['legacy_column']} "
+            f"  R{mapping['round_no']:>2}: {mapping['legacy_column']}{suffix} "
             f"[{state}, {handicap}]"
         )
 
     if report["warnings"]:
-        print("\nWarnings:")
+        print("\nWarnings / planned normalizations:")
         for warning in report["warnings"]:
             print(f"  - {warning}")
 
