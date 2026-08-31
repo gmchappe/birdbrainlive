@@ -1,0 +1,5 @@
+-- Default payout configuration template
+-- Insert after creating a league.
+-- Bands: 1-5: 100%; 6-10: 60/40; 11-15: 50/30/20;
+-- 16-20: 40/30/20/10; 21+: 40/25/15/12/8.
+-- Suggested contribution rules: standard=$4/player, full payout=$5/player.
