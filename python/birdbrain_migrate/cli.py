@@ -18,14 +18,19 @@ from analyze_staging import analyze, connect_db, nonblank  # noqa: E402
 import bootstrap_normalized as bootstrap_module  # noqa: E402
 
 
+MISSING_PAST_UNPLAYED_PAR = "__BB_MISSING_PAST_UNPLAYED_PAR__"
+
+
+class MissingPastUnplayedPar(int):
+    """Sentinel used only inside the migration compatibility context."""
+
+
 def parse_google_export_date(value) -> date | None:
     """Accept date-only and datetime-shaped values emitted by Google CSV exports."""
     text = nonblank(value)
     if not text:
         return None
 
-    # Google's CSV export commonly emits midnight timestamps such as
-    # 2026-04-12 00:00:00 even when the Sheet cell is conceptually a date.
     formats = (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
@@ -46,7 +51,6 @@ def parse_google_export_date(value) -> date | None:
         except ValueError:
             pass
 
-    # Also accept ISO 8601 values with timezone offsets or a trailing Z.
     iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
     try:
         return datetime.fromisoformat(iso_text).date()
@@ -54,9 +58,8 @@ def parse_google_export_date(value) -> date | None:
         raise ValueError(f"Unrecognized date value: {value!r}") from exc
 
 
-# Patch the shared migration module before importing parity_check. apply_bootstrap
-# resolves parse_date from bootstrap_normalized at runtime, and parity_check imports
-# the same function below, so both code paths use the exact same robust parser.
+# apply_bootstrap resolves parse_date from bootstrap_normalized at runtime, and
+# parity_check imports the same module, so both paths use the same robust parser.
 bootstrap_module.parse_date = parse_google_export_date
 
 from bootstrap_normalized import (  # noqa: E402
@@ -80,14 +83,7 @@ def write_report(prefix: str, snapshot_id: int, payload: dict) -> Path:
 
 
 def fill_unambiguous_schedule_layout_metadata(rows: dict) -> list[dict]:
-    """Fill missing schedule layout metadata only from the same known layout.
-
-    Cancelled legacy rounds can have partially blank schedule rows. For each exact
-    Course + Layout pair, a missing Par/ParFours/ParFives value may be copied only
-    when every nonblank occurrence of that field elsewhere in the schedule agrees
-    on one value. Conflicting layout history is left untouched and will still fail
-    downstream rather than being guessed.
-    """
+    """Fill missing layout metadata only when identical Course+Layout rows agree."""
     schedule = rows.get("League Schedule", [])
     known: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
         lambda: {"Par": set(), "ParFours": set(), "ParFives": set()}
@@ -130,14 +126,7 @@ def fill_unambiguous_schedule_layout_metadata(rows: dict) -> list[dict]:
 
 
 def unresolved_layout_hole_rows(rows: dict) -> list[dict]:
-    """Find schedule rows whose aggregate par cannot be reconstructed safely.
-
-    The legacy schedule stores only ParFours and ParFives, implicitly assuming
-    every other hole is par 3. Some historical rows violate that assumption
-    (for example a par-58 layout whose listed par-4 holes sum to par 59 under
-    the implicit rule). The source does not identify a par-2 hole or otherwise
-    tell us which hole-level value is wrong, so migration must not guess.
-    """
+    """Find nonblank aggregate pars that cannot be expanded into hole-level pars."""
     unresolved: list[dict] = []
     for row in rows.get("League Schedule", []):
         round_no = bootstrap_module.decimal_int(row.get("RoundNo"))
@@ -158,31 +147,71 @@ def unresolved_layout_hole_rows(rows: dict) -> list[dict]:
                     "course": nonblank(row.get("Course")),
                     "layout": nonblank(row.get("Layout")),
                     "par": par,
-                    "par_fours": fours,
-                    "par_fives": fives,
                     "assumption_total": calculated_par,
-                    "hole_count": hole_count,
                 }
             )
     return unresolved
 
 
-@contextmanager
-def tolerate_unresolved_layout_holes():
-    """Temporarily skip hole-row inserts when legacy par metadata is ambiguous.
+def mark_past_unplayed_missing_par(rows: dict, report: dict) -> list[dict]:
+    """Mark blank Par only for unplayed rounds at/before the migration cutoff.
 
-    bootstrap_normalized's historical importer assumes all unspecified holes are
-    par 3. When that assumption conflicts with the authoritative aggregate Par,
-    preserve the layout's aggregate par and hole_count but omit layout_holes for
-    that occurrence. This is a migration-only compatibility shim; it never
-    fabricates a par-2/par-4 assignment.
+    Played rounds and future scheduled rounds remain strict: a blank Par there is
+    left untouched so bootstrap_normalized will fail rather than guess.
     """
+    completed = [
+        int(m["round_no"])
+        for m in report["round_mappings"]
+        if m["has_season_score_column"]
+    ]
+    cutoff = max(completed, default=0)
+    mapping_by_round = {int(m["round_no"]): m for m in report["round_mappings"]}
+    marked: list[dict] = []
+
+    for row in rows.get("League Schedule", []):
+        round_no = bootstrap_module.decimal_int(row.get("RoundNo"))
+        if round_no is None or round_no > cutoff or nonblank(row.get("Par")):
+            continue
+        mapping = mapping_by_round.get(round_no)
+        if mapping is None or mapping["has_season_score_column"]:
+            continue
+        row["Par"] = MISSING_PAST_UNPLAYED_PAR
+        marked.append(
+            {
+                "round_no": round_no,
+                "course": nonblank(row.get("Course")),
+                "layout": nonblank(row.get("Layout")),
+            }
+        )
+    return marked
+
+
+@contextmanager
+def tolerate_layout_import_gaps():
+    """Migration-only compatibility for ambiguous holes and past unplayed NULL par.
+
+    A special sentinel is converted to NULL before layout insertion. The sentinel
+    is only placed on unplayed pre-cutoff schedule rows by
+    mark_past_unplayed_missing_par(). Ambiguous hole-level par metadata similarly
+    preserves aggregate layout par but skips the layout_holes insert loop.
+    """
+    original_decimal_int = bootstrap_module.decimal_int
     original_infer = bootstrap_module.infer_hole_count
+    original_get_layout = bootstrap_module.get_or_create_layout
     had_module_range = "range" in bootstrap_module.__dict__
     original_module_range = bootstrap_module.__dict__.get("range")
     state = {"skip_next_hole_range": False}
 
+    def migration_decimal_int(value):
+        if nonblank(value) == MISSING_PAST_UNPLAYED_PAR:
+            return MissingPastUnplayedPar(0)
+        return original_decimal_int(value)
+
     def tolerant_infer(par, fours, fives):
+        if isinstance(par, MissingPastUnplayedPar):
+            referenced = max(fours + fives, default=0)
+            state["skip_next_hole_range"] = True
+            return max(18, referenced)
         try:
             return original_infer(par, fours, fives)
         except ValueError:
@@ -190,20 +219,43 @@ def tolerate_unresolved_layout_holes():
             state["skip_next_hole_range"] = True
             return max(18, referenced)
 
+    def tolerant_get_layout(
+        cur,
+        cache,
+        course_cache,
+        course_name,
+        layout_name,
+        par,
+        hole_count=18,
+    ):
+        if isinstance(par, MissingPastUnplayedPar):
+            par = None
+        return original_get_layout(
+            cur,
+            cache,
+            course_cache,
+            course_name,
+            layout_name,
+            par,
+            hole_count,
+        )
+
     def migration_range(*args):
-        # In apply_bootstrap the next range() after infer_hole_count is exactly
-        # the layout_holes insertion loop. Suppress only that one loop.
         if state["skip_next_hole_range"]:
             state["skip_next_hole_range"] = False
             return builtins.range(0)
         return builtins.range(*args)
 
+    bootstrap_module.decimal_int = migration_decimal_int
     bootstrap_module.infer_hole_count = tolerant_infer
+    bootstrap_module.get_or_create_layout = tolerant_get_layout
     bootstrap_module.range = migration_range
     try:
         yield
     finally:
+        bootstrap_module.decimal_int = original_decimal_int
         bootstrap_module.infer_hole_count = original_infer
+        bootstrap_module.get_or_create_layout = original_get_layout
         if had_module_range:
             bootstrap_module.range = original_module_range
         else:
@@ -270,6 +322,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     rows = normalize_rows_for_bootstrap(report, source_rows)
     metadata_fills = fill_unambiguous_schedule_layout_metadata(rows)
     unresolved_holes = unresolved_layout_hole_rows(rows)
+    missing_past_par = mark_past_unplayed_missing_par(rows, report)
     summary = plan_summary(report, rows)
     summary["identity_merges"] = sum(
         len(groups) for groups in report.get("identity_merges", {}).values()
@@ -277,6 +330,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     summary["poolwise_schema"] = report.get("poolwise_schema_variant")
     summary["schedule_metadata_fills"] = len(metadata_fills)
     summary["unresolved_hole_par_rounds"] = len(unresolved_holes)
+    summary["past_unplayed_missing_par_rounds"] = len(missing_past_par)
 
     print(f"Snapshot ID: {snapshot_id}")
     print("Bootstrap plan (after deterministic source normalization):")
@@ -287,9 +341,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         print("\nSchedule metadata recovered from identical Course + Layout rows:")
         for item in metadata_fills:
             fields = ", ".join(f"{key}={value!r}" for key, value in item["filled"].items())
-            print(
-                f"  R{item['round_no']}: {item['course']} - {item['layout']} <- {fields}"
-            )
+            print(f"  R{item['round_no']}: {item['course']} - {item['layout']} <- {fields}")
 
     if unresolved_holes:
         print("\nUnresolved legacy hole-level par metadata:")
@@ -300,14 +352,22 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
                 "aggregate par will be preserved and hole-level pars will not be guessed."
             )
 
+    if missing_past_par:
+        print("\nPast unplayed rounds with no recoverable Par:")
+        for item in missing_past_par:
+            print(
+                f"  R{item['round_no']}: {item['course']} - {item['layout']} -> "
+                "layout par will remain NULL and no hole pars will be created."
+            )
+
     if not args.apply:
         print("\nDRY RUN ONLY: no normalized tables were changed.")
         print("Re-run with --apply after reviewing this plan.")
         return
 
     print("\nBeginning transactional normalized import...", flush=True)
-    if unresolved_holes:
-        with tolerate_unresolved_layout_holes():
+    if unresolved_holes or missing_past_par:
+        with tolerate_layout_import_gaps():
             apply_bootstrap(snapshot_id, report, rows, args.league_name)
     else:
         apply_bootstrap(snapshot_id, report, rows, args.league_name)
@@ -317,6 +377,11 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         print(
             f"Note: {len(unresolved_holes)} round(s) retained aggregate layout par without "
             "inventing ambiguous hole-level pars."
+        )
+    if missing_past_par:
+        print(
+            f"Note: {len(missing_past_par)} past unplayed round(s) retained NULL layout par; "
+            "cutover cleanup should mark them cancelled."
         )
     print("Run parity next; do not wire Shiny to Postgres until parity passes.")
 
