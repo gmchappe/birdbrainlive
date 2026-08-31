@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
@@ -76,6 +78,87 @@ def write_report(prefix: str, snapshot_id: int, payload: dict) -> Path:
     return path
 
 
+def unresolved_layout_hole_rows(rows: dict) -> list[dict]:
+    """Find schedule rows whose aggregate par cannot be reconstructed safely.
+
+    The legacy schedule stores only ParFours and ParFives, implicitly assuming
+    every other hole is par 3. Some historical rows violate that assumption
+    (for example a par-58 layout whose listed par-4 holes sum to par 59 under
+    the implicit rule). The source does not identify a par-2 hole or otherwise
+    tell us which hole-level value is wrong, so migration must not guess.
+    """
+    unresolved: list[dict] = []
+    for row in rows.get("League Schedule", []):
+        round_no = bootstrap_module.decimal_int(row.get("RoundNo"))
+        par = bootstrap_module.decimal_int(row.get("Par"))
+        if round_no is None or par is None:
+            continue
+        fours = bootstrap_module.parse_holes(row.get("ParFours"))
+        fives = bootstrap_module.parse_holes(row.get("ParFives"))
+        try:
+            bootstrap_module.infer_hole_count(par, fours, fives)
+        except ValueError:
+            referenced = max(fours + fives, default=0)
+            hole_count = max(18, referenced)
+            calculated_par = 3 * hole_count + len(fours) + 2 * len(fives)
+            unresolved.append(
+                {
+                    "round_no": round_no,
+                    "course": nonblank(row.get("Course")),
+                    "layout": nonblank(row.get("Layout")),
+                    "par": par,
+                    "par_fours": fours,
+                    "par_fives": fives,
+                    "assumption_total": calculated_par,
+                    "hole_count": hole_count,
+                }
+            )
+    return unresolved
+
+
+@contextmanager
+def tolerate_unresolved_layout_holes():
+    """Temporarily skip hole-row inserts when legacy par metadata is ambiguous.
+
+    bootstrap_normalized's historical importer assumes all unspecified holes are
+    par 3. When that assumption conflicts with the authoritative aggregate Par,
+    preserve the layout's aggregate par and hole_count but omit layout_holes for
+    that occurrence. This is a migration-only compatibility shim; it never
+    fabricates a par-2/par-4 assignment.
+    """
+    original_infer = bootstrap_module.infer_hole_count
+    had_module_range = "range" in bootstrap_module.__dict__
+    original_module_range = bootstrap_module.__dict__.get("range")
+    state = {"skip_next_hole_range": False}
+
+    def tolerant_infer(par, fours, fives):
+        try:
+            return original_infer(par, fours, fives)
+        except ValueError:
+            referenced = max(fours + fives, default=0)
+            state["skip_next_hole_range"] = True
+            return max(18, referenced)
+
+    def migration_range(*args):
+        # In apply_bootstrap the next range() after infer_hole_count is exactly
+        # the layout_holes insertion loop. Suppress only that one loop.
+        if state["skip_next_hole_range"]:
+            state["skip_next_hole_range"] = False
+            return builtins.range(0)
+        return builtins.range(*args)
+
+    bootstrap_module.infer_hole_count = tolerant_infer
+    bootstrap_module.range = migration_range
+    try:
+        yield
+    finally:
+        bootstrap_module.infer_hole_count = original_infer
+        if had_module_range:
+            bootstrap_module.range = original_module_range
+        else:
+            bootstrap_module.__dict__.pop("range", None)
+
+
 def cmd_load(args: argparse.Namespace) -> None:
     snapshot_id = load_snapshot(args.snapshot)
     print(f"Loaded snapshot_id={snapshot_id} into migration_staging.")
@@ -134,23 +217,46 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         conn.close()
 
     rows = normalize_rows_for_bootstrap(report, source_rows)
+    unresolved_holes = unresolved_layout_hole_rows(rows)
     summary = plan_summary(report, rows)
     summary["identity_merges"] = sum(
         len(groups) for groups in report.get("identity_merges", {}).values()
     )
     summary["poolwise_schema"] = report.get("poolwise_schema_variant")
+    summary["unresolved_hole_par_rounds"] = len(unresolved_holes)
 
     print(f"Snapshot ID: {snapshot_id}")
     print("Bootstrap plan (after deterministic source normalization):")
     for key, value in summary.items():
         print(f"  {key}: {value}")
+
+    if unresolved_holes:
+        print("\nUnresolved legacy hole-level par metadata:")
+        for item in unresolved_holes:
+            print(
+                f"  R{item['round_no']}: {item['course']} - {item['layout']} "
+                f"aggregate par={item['par']}, implicit hole total={item['assumption_total']}; "
+                "aggregate par will be preserved and hole-level pars will not be guessed."
+            )
+
     if not args.apply:
         print("\nDRY RUN ONLY: no normalized tables were changed.")
         print("Re-run with --apply after reviewing this plan.")
         return
-    apply_bootstrap(snapshot_id, report, rows, args.league_name)
+
+    print("\nBeginning transactional normalized import...", flush=True)
+    if unresolved_holes:
+        with tolerate_unresolved_layout_holes():
+            apply_bootstrap(snapshot_id, report, rows, args.league_name)
+    else:
+        apply_bootstrap(snapshot_id, report, rows, args.league_name)
     print("\nBootstrap import COMMITTED.")
     print(f"Migration standings baseline is through round {summary['latest_completed_round']}.")
+    if unresolved_holes:
+        print(
+            f"Note: {len(unresolved_holes)} round(s) retained aggregate layout par without "
+            "inventing ambiguous hole-level pars."
+        )
     print("Run parity next; do not wire Shiny to Postgres until parity passes.")
 
 
