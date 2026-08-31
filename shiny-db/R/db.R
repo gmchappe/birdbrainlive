@@ -36,7 +36,7 @@ bb_get_schedule <- function(pool) {
   DBI::dbGetQuery(
     pool,
     paste(
-      'SELECT "Course", "Layout", "Date", "StartTime", "Note", "RoundNo"',
+      'SELECT "Course", "Layout", "Date", "StartTime", "Note", "RoundNo", "AcePot"',
       'FROM v_schedule',
       'WHERE "Datend" >= CURRENT_DATE - 1',
       'ORDER BY "Datend", "RoundNo"'
@@ -75,6 +75,6 @@ bb_get_aces <- function(pool) {
 bb_get_champions <- function(pool) {
   DBI::dbGetQuery(
     pool,
-    'SELECT * FROM v_hall_of_champions ORDER BY "Season", "Date", "Name"'
+    'SELECT "Event", "Year", "Division", "Name", "Score" FROM v_hall_of_champions ORDER BY "Year", "Event", "Division", "Name"'
   )
 }
