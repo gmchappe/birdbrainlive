@@ -1,0 +1,10 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.env
+.Renviron
+*.sqlite
+*.sqlite3
+__pycache__/
+.venv/
