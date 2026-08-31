@@ -36,7 +36,6 @@ def mark_unplayed_missing_par(rows: dict, report: dict) -> list[dict]:
             # untouched so bootstrap_normalized fails rather than guessing.
             continue
 
-        # Reuse the existing CLI migration sentinel and compatibility context.
         row["Par"] = migration_cli.MISSING_PAST_UNPLAYED_PAR
         marked.append(
             {
@@ -50,109 +49,66 @@ def mark_unplayed_missing_par(rows: dict, report: dict) -> list[dict]:
 
 
 # cmd_bootstrap resolves this global function at runtime. Replacing it here lets
-# the one-shot migration use the corrected policy without changing staged data or
-# weakening validation for rounds that actually have score history.
+# the one-shot migration allow NULL par for unplayed rounds without weakening
+# validation for rounds that actually have score history.
 migration_cli.mark_past_unplayed_missing_par = mark_unplayed_missing_par
 
 
 _original_normalize_rows = migration_cli.normalize_rows_for_bootstrap
 
 
-def _meaningful_sham_signature(row: dict) -> tuple[str, ...]:
-    """Fields that define one historical SHAM pool observation.
+def normalize_rows_with_sham_semantic_check(report: dict, rows: dict) -> dict:
+    """Validate the real legacy SHAM identifier semantics without rewriting them.
 
-    LegacyRdNo is intentionally excluded: in the live legacy sheet it is the old
-    completed-round sequence, while RdNo has been normalized to the actual league
-    schedule RoundNo. If two source rows map to the same actual round/pool and all
-    statistical content agrees, they are duplicate representations of one fact.
+    bbsham.R defines RdNo as an all-time monotonically increasing SHAM observation
+    sequence and RoundNo as the round number within that season. Neither is used
+    as a PostgreSQL identity. We only verify that a source RdNo/Pool pair is not
+    repeated, because bbsham.R writes at most one row per pool for each RdNo.
     """
-    fields = (
-        "Course",
-        "Layout",
-        "Par",
-        "Players",
-        "Strokes",
-        "Avg",
-        "StdDev",
-        "ParStrokes",
-    )
-    return tuple(nonblank(row.get(field)) for field in fields)
+    normalized = _original_normalize_rows(report, rows)
+    sham_rows = normalized.get("Poolwise Strokes by Round", [])
 
-
-def _dedupe_sham_pool_rows(rows: list[dict]) -> tuple[list[dict], int]:
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    passthrough: list[dict] = []
-
-    for row in rows:
+    sequences: set[int] = set()
+    for row in sham_rows:
         rdno = nonblank(row.get("RdNo"))
         pool = nonblank(row.get("Pool")).upper()
-        if not rdno or not pool:
-            passthrough.append(row)
+        if not rdno or pool not in {"A", "B", "C", "D", "E"}:
             continue
         grouped[(rdno, pool)].append(row)
+        try:
+            sequences.add(int(rdno))
+        except ValueError:
+            raise ValueError(f"Poolwise Strokes has non-integer legacy RdNo {rdno!r}.")
 
-    result = list(passthrough)
-    collapsed = 0
-    conflicts: list[str] = []
-
-    for (rdno, pool), group in grouped.items():
-        if len(group) == 1:
-            result.append(group[0])
-            continue
-
-        signatures = {_meaningful_sham_signature(row) for row in group}
-        if len(signatures) == 1:
-            result.append(group[0])
-            collapsed += len(group) - 1
-            continue
-
-        details = []
-        for index, row in enumerate(group, start=1):
-            details.append(
-                f"row{index}(LegacyRdNo={nonblank(row.get('LegacyRdNo'))!r}, "
-                f"Course={nonblank(row.get('Course'))!r}, "
-                f"Layout={nonblank(row.get('Layout'))!r}, "
-                f"Par={nonblank(row.get('Par'))!r}, "
-                f"Players={nonblank(row.get('Players'))!r}, "
-                f"Strokes={nonblank(row.get('Strokes'))!r}, "
-                f"ParStrokes={nonblank(row.get('ParStrokes'))!r})"
-            )
-        conflicts.append(f"Round {rdno}, pool {pool}: " + "; ".join(details))
-
-    if conflicts:
+    duplicates = [key for key, group in grouped.items() if len(group) > 1]
+    if duplicates:
+        preview = ", ".join(f"RdNo={rdno}/Pool={pool}" for rdno, pool in duplicates[:10])
         raise ValueError(
-            "Conflicting duplicate SHAM rows map to the same (round, pool); "
-            "migration will not guess which is authoritative:\n  - "
-            + "\n  - ".join(conflicts)
+            "Poolwise Strokes contains repeated true legacy (RdNo, Pool) pairs; "
+            f"migration will not collapse them: {preview}"
         )
 
-    return result, collapsed
-
-
-def normalize_rows_with_sham_dedupe(report: dict, rows: dict) -> dict:
-    normalized = _original_normalize_rows(report, rows)
-    deduped, collapsed = _dedupe_sham_pool_rows(
-        normalized.get("Poolwise Strokes by Round", [])
-    )
-    normalized["Poolwise Strokes by Round"] = deduped
-    if collapsed:
+    if sequences:
         print(
-            f"Normalized SHAM history: collapsed {collapsed} exact duplicate "
-            "round/pool row(s).",
+            "SHAM history semantics verified: "
+            f"{len(sham_rows)} pool rows across {len(sequences)} all-time RdNo values "
+            f"({min(sequences)}..{max(sequences)}). RoundNo remains season-local source "
+            "metadata and is not used as a database key.",
             flush=True,
         )
+
     return normalized
 
 
-migration_cli.normalize_rows_for_bootstrap = normalize_rows_with_sham_dedupe
+migration_cli.normalize_rows_for_bootstrap = normalize_rows_with_sham_semantic_check
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "BirdBrain normalized bootstrap with NULL-par support for any unplayed "
-            "schedule round and guarded SHAM duplicate normalization. Dry-run is "
-            "the default."
+            "BirdBrain normalized bootstrap with NULL-par support for unplayed "
+            "rounds and legacy SHAM identifier validation. Dry-run is the default."
         )
     )
     parser.add_argument("--snapshot-id", type=int)
