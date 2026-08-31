@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS sham_pool_round_stats (
 
 -- Existing all-time aces can predate the current workbook. Allow a historical
 -- ace to identify the player/layout/date directly without fabricating a round.
+-- Legacy BirdBrain could split a multiple-ace pot fractionally, so preserve the
+-- recorded amount exactly even though future rules require whole-dollar awards.
 ALTER TABLE ace_awards
+  ALTER COLUMN payout TYPE numeric(12,2) USING payout::numeric,
   ALTER COLUMN round_id DROP NOT NULL,
   ALTER COLUMN round_participant_id DROP NOT NULL,
   ADD COLUMN IF NOT EXISTS player_id bigint REFERENCES players(player_id),
