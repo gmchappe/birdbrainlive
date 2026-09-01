@@ -76,9 +76,40 @@ def current_or_new_password() -> str:
     return existing or secrets.token_urlsafe(32)
 
 
-def role_exists(cur) -> bool:
-    cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", (ROLE_NAME,))
-    return bool(cur.fetchone()[0])
+def role_attributes(cur) -> dict[str, bool] | None:
+    cur.execute(
+        """
+        SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole,
+               rolreplication, rolbypassrls
+        FROM pg_roles
+        WHERE rolname = %s
+        """,
+        (ROLE_NAME,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "login": bool(row[0]),
+        "superuser": bool(row[1]),
+        "createdb": bool(row[2]),
+        "createrole": bool(row[3]),
+        "replication": bool(row[4]),
+        "bypassrls": bool(row[5]),
+    }
+
+
+def assert_reader_role_is_not_elevated(attrs: dict[str, bool]) -> None:
+    elevated = [
+        key
+        for key in ("superuser", "createdb", "createrole", "replication", "bypassrls")
+        if attrs.get(key)
+    ]
+    if elevated:
+        raise RuntimeError(
+            f"Refusing to provision {ROLE_NAME!r}: existing role has elevated "
+            f"attributes {elevated}. Resolve that role manually before continuing."
+        )
 
 
 def provision(password: str) -> None:
@@ -86,27 +117,40 @@ def provision(password: str) -> None:
     try:
         with conn.transaction():
             with conn.cursor() as cur:
-                if not role_exists(cur):
-                    cur.execute(
-                        sql.SQL(
-                            "CREATE ROLE {} WITH LOGIN NOSUPERUSER NOCREATEDB "
-                            "NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-                        ).format(sql.Identifier(ROLE_NAME))
-                    )
+                attrs = role_attributes(cur)
 
-                # ALTER ROLE ... PASSWORD is utility/DDL syntax and PostgreSQL does
-                # not accept a bind parameter in this grammar position. Compose the
-                # generated secret as a Psycopg SQL literal so quoting/escaping is
-                # handled safely without exposing the password in output.
-                cur.execute(
-                    sql.SQL(
-                        "ALTER ROLE {} WITH LOGIN NOSUPERUSER NOCREATEDB "
-                        "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
-                    ).format(
-                        sql.Identifier(ROLE_NAME),
-                        sql.Literal(password),
+                if attrs is None:
+                    # PostgreSQL defaults new roles to NOSUPERUSER, NOCREATEDB,
+                    # NOCREATEROLE, NOREPLICATION, and NOBYPASSRLS. Avoid spelling
+                    # those restricted attributes in a later ALTER ROLE: Supabase's
+                    # postgres role is intentionally not a true superuser.
+                    cur.execute(
+                        sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD {}").format(
+                            sql.Identifier(ROLE_NAME),
+                            sql.Literal(password),
+                        )
                     )
-                )
+                    attrs = role_attributes(cur)
+                    if attrs is None:
+                        raise RuntimeError(f"Failed to create role {ROLE_NAME!r}.")
+                else:
+                    assert_reader_role_is_not_elevated(attrs)
+                    # LOGIN and PASSWORD are the only role attributes we need to
+                    # change on an existing non-elevated role. Do not include
+                    # NOSUPERUSER/NOREPLICATION/NOBYPASSRLS here: PostgreSQL treats
+                    # altering those protected properties as superuser-only.
+                    cur.execute(
+                        sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {}").format(
+                            sql.Identifier(ROLE_NAME),
+                            sql.Literal(password),
+                        )
+                    )
+                    attrs = role_attributes(cur)
+                    if attrs is None:
+                        raise RuntimeError(f"Role {ROLE_NAME!r} disappeared during provisioning.")
+
+                assert_reader_role_is_not_elevated(attrs)
+
                 cur.execute(
                     sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
                         sql.Identifier(os.environ["BB_DB_NAME"]),
