@@ -33,13 +33,7 @@ def latest_snapshot(cur) -> int:
 
 
 def staged_hall_rows(cur, snapshot_id: int) -> list[tuple[int, dict[str, str]]]:
-    """Reconstruct Hall rows from the staging array + recorded header contract.
-
-    migration_staging.google_sheet_rows.row_data intentionally stores the exact
-    CSV row as a JSON array. snapshot_sheets.headers supplies the corresponding
-    column names. Keep row_number from staging so dry-run diagnostics point back
-    to the original spreadsheet row.
-    """
+    """Reconstruct Hall rows from the staging array + recorded header contract."""
     cur.execute(
         """
         SELECT headers
@@ -99,16 +93,32 @@ def hall_repair_plan(snapshot_id: int | None):
             staged = staged_hall_rows(cur, int(snapshot_id))
 
             source: list[dict] = []
+            placeholders: list[dict] = []
             for row_number, data in staged:
                 event = nonblank(data.get("Event"))
                 year = parse_year(data.get("Year"))
                 name = nonblank(data.get("Name"))
                 division = nonblank(data.get("Division"))
                 score = nonblank(data.get("Score"))
+
+                # The legacy Hall sheet contains some label/placeholder rows such as
+                # "League Semifinalist | 2020" with no person. They were displayed
+                # by Shiny because the sheet was rendered verbatim, but they are not
+                # champion facts and cannot map to normalized hall_of_champions,
+                # whose player_id is intentionally required.
                 if not event or year is None or not name:
-                    raise RuntimeError(
-                        f"Hall source row {row_number} has incomplete identity: {data}"
+                    placeholders.append(
+                        {
+                            "row_number": int(row_number),
+                            "event": event,
+                            "year": year,
+                            "name": name,
+                            "division": division,
+                            "score": score,
+                            "raw": data,
+                        }
                     )
+                    continue
 
                 pid = player_ids.get(normalized_name(name))
                 if pid is None:
@@ -165,7 +175,7 @@ def hall_repair_plan(snapshot_id: int | None):
                     missing.append(item)
 
             extras = list(remaining.elements())
-            return int(snapshot_id), source, missing, extras
+            return int(snapshot_id), source, placeholders, missing, extras
     finally:
         conn.close()
 
@@ -203,35 +213,47 @@ def apply_repair(missing: list[dict]) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Repair Hall of Champions rows lost by the legacy bootstrap uniqueness "
-            "constraint. Dry-run is the default."
+            "Check complete Hall of Champions facts against the staged source and "
+            "repair only genuine missing champion rows. Dry-run is the default."
         )
     )
     parser.add_argument("--snapshot-id", type=int)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 
-    snapshot_id, source, missing, extras = hall_repair_plan(args.snapshot_id)
+    snapshot_id, source, placeholders, missing, extras = hall_repair_plan(args.snapshot_id)
     print(f"History repair check for snapshot_id={snapshot_id}")
-    print(f"Hall source rows: {len(source)}")
-    print(f"Missing Hall rows: {len(missing)}")
+    print(f"Complete Hall source rows: {len(source)}")
+    print(f"Non-authoritative Hall placeholder rows: {len(placeholders)}")
+    print(f"Missing complete Hall rows: {len(missing)}")
     print(f"Unexpected database Hall rows: {len(extras)}")
 
+    if placeholders:
+        print("\nHall placeholder rows excluded from normalized champion facts:")
+        for item in placeholders[:20]:
+            print(
+                f"  source row {item['row_number']}: "
+                f"{item['year'] or ''} | {item['event']} | {item['division']} | "
+                f"{item['name']} | {item['score']}"
+            )
+        if len(placeholders) > 20:
+            print(f"  ... and {len(placeholders) - 20} more")
+
     if extras:
-        print("\nRepair refused: database contains Hall rows not present in the staged source.")
+        print("\nRepair refused: database contains complete Hall rows not present in the staged source.")
         for key in extras[:20]:
             print(f"  extra={key}")
         raise SystemExit(2)
 
     if missing:
-        print("\nHall rows to restore:")
+        print("\nComplete Hall rows to restore:")
         for item in missing:
             print(
                 f"  source row {item['row_number']}: {item['year']} | "
                 f"{item['event']} | {item['division']} | {item['name']} | {item['score']}"
             )
     else:
-        print("Hall history already matches the staged source.")
+        print("\nAll complete Hall champion facts already match the staged source.")
         return
 
     if not args.apply:
@@ -239,7 +261,7 @@ def main() -> None:
         return
 
     inserted = apply_repair(missing)
-    print(f"\nInserted {inserted} missing Hall row(s).")
+    print(f"\nInserted {inserted} genuinely missing Hall row(s).")
 
 
 if __name__ == "__main__":
