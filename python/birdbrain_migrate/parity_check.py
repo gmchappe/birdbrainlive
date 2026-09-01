@@ -113,6 +113,30 @@ def canonical_row(sheet: str, row: dict[str, Any], columns: list[str]) -> tuple[
     return tuple(result)
 
 
+def authoritative_source_rows(
+    sheet: str, rows: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    """Return rows representable as normalized application facts.
+
+    The legacy Hall sheet contains label/placeholder rows with an Event and Year
+    but no Name. Legacy Shiny displayed the sheet verbatim, but the normalized
+    hall_of_champions table intentionally requires a player_id. Those placeholders
+    are retained in the immutable staging snapshot for auditability and excluded
+    from normalized champion-fact parity rather than being fabricated as players.
+    """
+    if sheet != "Hall of Champions":
+        return rows, 0
+
+    kept: list[dict[str, Any]] = []
+    ignored = 0
+    for row in rows:
+        if nonblank(row.get("Event")) and parse_int(row.get("Year")) is not None and nonblank(row.get("Name")):
+            kept.append(row)
+        else:
+            ignored += 1
+    return kept, ignored
+
+
 def fetch_view_rows(cur, view: str, columns: list[str]) -> list[dict[str, Any]]:
     quoted = ", ".join(f'"{column}"' for column in columns)
     cur.execute(f"SELECT {quoted} FROM {view}")
@@ -162,7 +186,9 @@ def run_parity(snapshot_id: int | None) -> dict[str, Any]:
 
             for sheet, spec in VIEW_SPECS.items():
                 columns = spec["columns"]
-                source_dicts = source.get(sheet, [])
+                source_dicts, ignored_source_rows = authoritative_source_rows(
+                    sheet, source.get(sheet, [])
+                )
                 db_dicts = fetch_view_rows(cur, spec["view"], columns)
 
                 source_rows = sorted(canonical_row(sheet, row, columns) for row in source_dicts)
@@ -172,6 +198,7 @@ def run_parity(snapshot_id: int | None) -> dict[str, Any]:
                 report["checks"][sheet] = {
                     "view": spec["view"],
                     "source_rows": len(source_rows),
+                    "ignored_non_authoritative_source_rows": ignored_source_rows,
                     "database_rows": len(db_rows),
                     "passed": passed,
                     "missing_from_database": [list(row) for row in missing[:20]],
@@ -210,16 +237,18 @@ def main() -> None:
     print(f"Source mode: {report['source_mode']}")
     for sheet, result in report["checks"].items():
         state = "PASS" if result["passed"] else "FAIL"
+        ignored = result.get("ignored_non_authoritative_source_rows", 0)
+        ignored_text = f" ignored={ignored}" if ignored else ""
         print(
             f"  {state:4} {sheet}: source={result['source_rows']} "
             f"db={result['database_rows']} missing={result['missing_count']} "
-            f"extra={result['extra_count']}"
+            f"extra={result['extra_count']}{ignored_text}"
         )
 
     print(f"\nFull report: {report_path}")
     if not report["all_passed"]:
         raise SystemExit(2)
-    print("All public compatibility views match the canonicalized staged snapshot.")
+    print("All normalized public compatibility views match the authoritative staged source facts.")
 
 
 if __name__ == "__main__":
