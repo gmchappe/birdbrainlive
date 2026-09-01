@@ -94,12 +94,18 @@ def provision(password: str) -> None:
                         ).format(sql.Identifier(ROLE_NAME))
                     )
 
+                # ALTER ROLE ... PASSWORD is utility/DDL syntax and PostgreSQL does
+                # not accept a bind parameter in this grammar position. Compose the
+                # generated secret as a Psycopg SQL literal so quoting/escaping is
+                # handled safely without exposing the password in output.
                 cur.execute(
                     sql.SQL(
                         "ALTER ROLE {} WITH LOGIN NOSUPERUSER NOCREATEDB "
-                        "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %s"
-                    ).format(sql.Identifier(ROLE_NAME)),
-                    (password,),
+                        "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
+                    ).format(
+                        sql.Identifier(ROLE_NAME),
+                        sql.Literal(password),
+                    )
                 )
                 cur.execute(
                     sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
