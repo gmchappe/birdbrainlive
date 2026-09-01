@@ -38,7 +38,12 @@ bb_get_schedule <- function(pool) {
     paste(
       'SELECT "Course", "Layout", "Date", "StartTime", "Note", "RoundNo", "AcePot"',
       'FROM v_schedule',
-      'WHERE "Datend" >= CURRENT_DATE - 1',
+      'WHERE "Datend" >= (',
+      "  timezone(",
+      "    COALESCE((SELECT timezone FROM leagues ORDER BY league_id LIMIT 1), 'America/Chicago'),",
+      "    CURRENT_TIMESTAMP",
+      "  )::date - 1",
+      ')',
       'ORDER BY "Datend", "RoundNo"'
     )
   )
