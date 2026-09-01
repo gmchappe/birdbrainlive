@@ -32,6 +32,53 @@ def latest_snapshot(cur) -> int:
     return int(value)
 
 
+def staged_hall_rows(cur, snapshot_id: int) -> list[tuple[int, dict[str, str]]]:
+    """Reconstruct Hall rows from the staging array + recorded header contract.
+
+    migration_staging.google_sheet_rows.row_data intentionally stores the exact
+    CSV row as a JSON array. snapshot_sheets.headers supplies the corresponding
+    column names. Keep row_number from staging so dry-run diagnostics point back
+    to the original spreadsheet row.
+    """
+    cur.execute(
+        """
+        SELECT headers
+        FROM migration_staging.snapshot_sheets
+        WHERE snapshot_id = %s
+          AND sheet_name = 'Hall of Champions'
+        """,
+        (snapshot_id,),
+    )
+    header_row = cur.fetchone()
+    if not header_row:
+        raise RuntimeError(
+            f"Snapshot {snapshot_id} has no staged 'Hall of Champions' sheet metadata."
+        )
+    headers = [str(value) for value in list(header_row[0])]
+
+    cur.execute(
+        """
+        SELECT row_number, row_data
+        FROM migration_staging.google_sheet_rows
+        WHERE snapshot_id = %s
+          AND sheet_name = 'Hall of Champions'
+        ORDER BY row_number
+        """,
+        (snapshot_id,),
+    )
+
+    reconstructed: list[tuple[int, dict[str, str]]] = []
+    for row_number, raw_row in cur.fetchall():
+        values = list(raw_row)
+        values += [""] * max(0, len(headers) - len(values))
+        data = {
+            header: nonblank(values[i]) if i < len(values) else ""
+            for i, header in enumerate(headers)
+        }
+        reconstructed.append((int(row_number), data))
+    return reconstructed
+
+
 def hall_repair_plan(snapshot_id: int | None):
     conn = connect_db()
     try:
@@ -49,17 +96,7 @@ def hall_repair_plan(snapshot_id: int | None):
             for season_id, season_year in cur.fetchall():
                 seasons_by_year.setdefault(int(season_year), []).append(int(season_id))
 
-            cur.execute(
-                """
-                SELECT row_number, row_data
-                FROM migration_staging.google_sheet_rows
-                WHERE snapshot_id = %s
-                  AND sheet_name = 'Hall of Champions'
-                ORDER BY row_number
-                """,
-                (snapshot_id,),
-            )
-            staged = cur.fetchall()
+            staged = staged_hall_rows(cur, int(snapshot_id))
 
             source: list[dict] = []
             for row_number, data in staged:
