@@ -1,14 +1,16 @@
 # Database-backed Shiny helpers
-# Target: shinyapps.io -> managed PostgreSQL/Supabase
+# Target: managed PostgreSQL/Supabase development database.
 # Requires packages DBI, RPostgres, and pool.
+#
+# Migration/admin utilities continue to use BB_DB_USER/BB_DB_PASSWORD. The Shiny
+# app prefers BB_SHINY_DB_USER/BB_SHINY_DB_PASSWORD when present so hosted Shiny
+# never needs the PostgreSQL admin credential.
 
 bb_db_pool <- function() {
   required <- c(
     "BB_DB_HOST",
     "BB_DB_PORT",
-    "BB_DB_NAME",
-    "BB_DB_USER",
-    "BB_DB_PASSWORD"
+    "BB_DB_NAME"
   )
 
   missing <- required[Sys.getenv(required) == ""]
@@ -19,6 +21,23 @@ bb_db_pool <- function() {
     )
   }
 
+  user <- Sys.getenv(
+    "BB_SHINY_DB_USER",
+    unset = Sys.getenv("BB_DB_USER", unset = "")
+  )
+  password <- Sys.getenv(
+    "BB_SHINY_DB_PASSWORD",
+    unset = Sys.getenv("BB_DB_PASSWORD", unset = "")
+  )
+
+  if (user == "" || password == "") {
+    stop(
+      "Missing BirdBrain Shiny database credentials. Set ",
+      "BB_SHINY_DB_USER/BB_SHINY_DB_PASSWORD (preferred) or ",
+      "BB_DB_USER/BB_DB_PASSWORD for local migration-only fallback."
+    )
+  }
+
   sslmode <- Sys.getenv("BB_DB_SSLMODE", unset = "require")
 
   pool::dbPool(
@@ -26,8 +45,8 @@ bb_db_pool <- function() {
     host = Sys.getenv("BB_DB_HOST"),
     port = as.integer(Sys.getenv("BB_DB_PORT")),
     dbname = Sys.getenv("BB_DB_NAME"),
-    user = Sys.getenv("BB_DB_USER"),
-    password = Sys.getenv("BB_DB_PASSWORD"),
+    user = user,
+    password = password,
     sslmode = sslmode
   )
 }
