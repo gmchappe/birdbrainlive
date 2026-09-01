@@ -113,6 +113,39 @@ def canonical_row(sheet: str, row: dict[str, Any], columns: list[str]) -> tuple[
     return tuple(result)
 
 
+def hall_historical_gaps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe source Hall rows that are not yet complete champion facts."""
+    gaps: list[dict[str, Any]] = []
+    for row_number, row in enumerate(rows, start=2):
+        event = nonblank(row.get("Event"))
+        year = parse_int(row.get("Year"))
+        name = nonblank(row.get("Name"))
+        if event and year is not None and name:
+            continue
+        missing_fields = [
+            field
+            for field, value in (("Event", event), ("Year", year), ("Name", name))
+            if value in (None, "")
+        ]
+        gaps.append(
+            {
+                "source_row_number": row_number,
+                "Event": event,
+                "Year": nonblank(row.get("Year")),
+                "Division": nonblank(row.get("Division")),
+                "Name": name,
+                "Score": nonblank(row.get("Score")),
+                "missing_fields": missing_fields,
+                "reason": (
+                    "missing_name_unconfirmed_historical_finisher"
+                    if missing_fields == ["Name"]
+                    else "incomplete_historical_champion_record"
+                ),
+            }
+        )
+    return gaps
+
+
 def authoritative_source_rows(
     sheet: str, rows: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], int]:
@@ -174,12 +207,18 @@ def run_parity(snapshot_id: int | None) -> dict[str, Any]:
                 sheet: get_sheet_rows(cur, snapshot_id, sheet, meta["headers"])
                 for sheet, meta in metadata.items()
             }
+            hall_gaps = hall_historical_gaps(raw_source.get("Hall of Champions", []))
             source = normalize_rows_for_bootstrap(analysis, raw_source)
 
             report: dict[str, Any] = {
                 "snapshot_id": snapshot_id,
-                "source_mode": "canonicalized_staged_snapshot",
+                "source_mode": (
+                    "canonicalized_staged_snapshot_with_documented_historical_gaps"
+                    if hall_gaps
+                    else "canonicalized_staged_snapshot"
+                ),
                 "identity_merges": analysis.get("identity_merges", {}),
+                "historical_data_gaps": {"Hall of Champions": hall_gaps},
                 "checks": {},
                 "all_passed": True,
             }
@@ -199,6 +238,7 @@ def run_parity(snapshot_id: int | None) -> dict[str, Any]:
                     "view": spec["view"],
                     "source_rows": len(source_rows),
                     "ignored_non_authoritative_source_rows": ignored_source_rows,
+                    "ignored_source_details": hall_gaps if sheet == "Hall of Champions" else [],
                     "database_rows": len(db_rows),
                     "passed": passed,
                     "missing_from_database": [list(row) for row in missing[:20]],
@@ -217,8 +257,9 @@ def run_parity(snapshot_id: int | None) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare normalized BirdBrain compatibility views with the canonicalized "
-            "staged Google snapshot."
+            "Compare normalized BirdBrain compatibility views with authoritative facts "
+            "from the canonicalized staged Google snapshot. Incomplete Hall placeholders "
+            "are documented rather than fabricated."
         )
     )
     parser.add_argument("--snapshot-id", type=int)
@@ -238,12 +279,23 @@ def main() -> None:
     for sheet, result in report["checks"].items():
         state = "PASS" if result["passed"] else "FAIL"
         ignored = result.get("ignored_non_authoritative_source_rows", 0)
-        ignored_text = f" ignored={ignored}" if ignored else ""
+        ignored_text = f" flagged_incomplete={ignored}" if ignored else ""
         print(
             f"  {state:4} {sheet}: source={result['source_rows']} "
             f"db={result['database_rows']} missing={result['missing_count']} "
             f"extra={result['extra_count']}{ignored_text}"
         )
+
+    gaps = report["historical_data_gaps"].get("Hall of Champions", [])
+    if gaps:
+        print("\nDocumented Hall of Champions historical gaps:")
+        for item in gaps:
+            print(
+                f"  source row {item['source_row_number']}: {item['Year']} | "
+                f"{item['Event']} | {item['Division']} | "
+                f"Name={item['Name'] or '[UNCONFIRMED]'} | {item['Score']} | "
+                f"{item['reason']}"
+            )
 
     print(f"\nFull report: {report_path}")
     if not report["all_passed"]:
