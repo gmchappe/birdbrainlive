@@ -98,10 +98,32 @@ main <- function() {
     )
   )
 
+  expected_login <- Sys.getenv("BB_SHINY_DB_USER", unset = "")
+  if (expected_login != "") {
+    # Supabase session-pooler usernames use role.project_ref; PostgreSQL reports
+    # current_user as the underlying role name only.
+    expected_role <- sub("\\..*$", "", expected_login)
+    actual_role <- connection_info$database_user[[1]]
+    if (!identical(actual_role, expected_role)) {
+      stop(
+        "Shiny credential isolation failed. Expected database role '",
+        expected_role,
+        "' but connected as '",
+        actual_role,
+        "'."
+      )
+    }
+  }
+
   cat("\nConnection\n")
   cat(sprintf("  database: %s\n", connection_info$database_name[[1]]))
   cat(sprintf("  user:     %s\n", connection_info$database_user[[1]]))
   cat(sprintf("  timezone: %s\n", connection_info$database_timezone[[1]]))
+  if (expected_login != "") {
+    cat("  security: least-privilege Shiny reader verified\n")
+  } else {
+    cat("  security: BB_SHINY_DB_USER not set; local admin fallback is active\n")
+  }
   cat("\nAll six Shiny read contracts passed. No database writes were attempted.\n")
 }
 
