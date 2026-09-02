@@ -119,8 +119,12 @@ cat("App:     birdbrain-db-dev\n")
 cat("Bundle:  ui.R, server.R, R/db.R only\n")
 cat("DB user: least-privilege BB_SHINY_DB_USER\n")
 cat("Secrets: synchronized as encrypted Connect environment variables\n")
+cat("Primary: inferred by rsconnect (server.R for this two-file Shiny app)\n")
 cat(sprintf("Local R: %s\n\n", R.version.string))
 
+# Do not force appMode here. rsconnect 1.11.0 uses its Shiny inference step to
+# set both appMode='shiny' and primaryFile='server.R'. Forcing appMode skips that
+# inference and leaves Connect Cloud's required primary_file as NULL.
 rsconnect::deployApp(
   appDir = app_dir,
   appFiles = app_files,
@@ -129,7 +133,6 @@ rsconnect::deployApp(
   account = account,
   server = "connect.posit.cloud",
   envVars = env_vars,
-  appMode = "shiny",
   launch.browser = TRUE,
   logLevel = "normal",
   dependencyResolution = "library"
