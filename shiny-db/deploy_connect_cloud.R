@@ -1,15 +1,13 @@
 # Secure development deployment for the PostgreSQL-backed BirdBrain Shiny app.
 #
-# Why Connect Cloud instead of a new shinyapps.io deployment?
 # Connect Cloud supports encrypted environment-variable synchronization, so the
-# database password is not bundled with the application source. The current
-# shinyapps.io platform does not provide equivalent secret-variable management.
+# database password is not bundled with the application source.
 #
 # One-time account registration (interactive R session):
 #   install.packages("rsconnect")
 #   rsconnect::connectCloudUser()
 #
-# Then run from the repository root with Rscript:
+# Then run from the repository root with a Connect-Cloud-supported R version:
 #   Rscript shiny-db/deploy_connect_cloud.R
 
 find_repo_root <- function(start = getwd()) {
@@ -38,6 +36,16 @@ if (file.exists(env_path)) {
 if (!requireNamespace("rsconnect", quietly = TRUE)) {
   stop(
     "Package 'rsconnect' is required. Install it with install.packages('rsconnect')."
+  )
+}
+
+# Connect Cloud currently supports R through 4.6.0. Do not publish a manifest
+# captured from a newer local R and hope the cloud runtime silently downgrades it.
+if (getRversion() > "4.6.0") {
+  stop(
+    "Posit Connect Cloud currently supports R through 4.6.0, but this process is ",
+    "running ", R.version.string, ". Run this deployment script with a side-by-side ",
+    "R 4.6.0 installation. Your normal R 4.6.1 installation can remain unchanged."
   )
 }
 
@@ -112,14 +120,6 @@ cat("Bundle:  ui.R, server.R, R/db.R only\n")
 cat("DB user: least-privilege BB_SHINY_DB_USER\n")
 cat("Secrets: synchronized as encrypted Connect environment variables\n")
 cat(sprintf("Local R: %s\n\n", R.version.string))
-
-if (getRversion() > "4.6.0") {
-  warning(
-    "Current Connect Cloud documentation lists R support through 4.6.0. ",
-    "This machine is running ", R.version.string,
-    ". If the build rejects the R version, deploy from a side-by-side R 4.6.0 installation."
-  )
-}
 
 rsconnect::deployApp(
   appDir = app_dir,
