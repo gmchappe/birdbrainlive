@@ -10,7 +10,7 @@ This branch preserves the current R/Shiny implementation while replacing Google 
 - `database/reference/` contains prior SQLite/schema design artifacts only; do not apply the SQLite schema directly to Supabase/PostgreSQL.
 - `database/migrations/` contains the production-target PostgreSQL schema.
 - `fixtures/` contains regression data for validating the migration.
-- `shiny-db/` is the PostgreSQL-backed development app. It must not replace production until hosted deployment validation is complete.
+- `shiny-db/` is the PostgreSQL-backed development app. It must not replace production until a deliberate production cutover is approved.
 
 ## Migration status
 
@@ -33,12 +33,13 @@ Completed:
 - Least-privilege `birdbrain_shiny_reader` PostgreSQL login provisioned and verified against all six compatibility views; direct `players` table SELECT is denied.
 - Local PostgreSQL-backed Shiny smoke test passed under `birdbrain_shiny_reader` rather than the migration/admin role.
 - Separate `birdbrain-db-dev` app successfully deployed to Posit Connect Cloud with encrypted database environment variables.
+- Hosted `birdbrain-db-dev` UI was manually validated successfully, including reactive refresh behavior.
 
 Current phase:
 
-- Visually validate the hosted `birdbrain-db-dev` Connect Cloud app against the already-validated local DB-backed app.
-- Confirm reactive refreshes remain clean in the hosted runtime.
-- Keep the current production shinyapps.io/Google-Sheets app unchanged during hosted validation.
+- Design and build transactional Round Finalizer writes against PostgreSQL.
+- Preserve the current validated read-only Connect Cloud app while write-path work is developed and tested separately.
+- Keep the current production shinyapps.io/Google-Sheets app unchanged until an explicit production cutover decision.
 
 ## Migration sequence
 
@@ -48,8 +49,8 @@ Current phase:
 4. Compare PostgreSQL compatibility views with the canonicalized staged outputs: schedule, leaderboard, current all-time, course records, aces, and hall of champions. **Complete.**
 5. Wire and validate the PostgreSQL-backed Shiny read path locally. **Complete.**
 6. Provision a least-privilege hosted Shiny database login and validate all six read contracts with it. **Complete.**
-7. Deploy a separate Connect Cloud development app with encrypted DB environment variables and validate it before any production read cutover. **Deployed; hosted validation in progress.**
-8. Only after the DB-backed hosted Shiny read path is validated, build transactional Round Finalizer writes.
+7. Deploy a separate Connect Cloud development app with encrypted DB environment variables and validate it before any production read cutover. **Complete.**
+8. Build transactional Round Finalizer writes with regression coverage and failure-safe rollback semantics. **In progress.**
 9. Port calculation engines from R to Python incrementally, using the same PostgreSQL schema and regression fixtures.
 
 ## Credentials
