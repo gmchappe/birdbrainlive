@@ -25,6 +25,7 @@ jobs:
           python python/birdbrain_finalizer/test_core.py
           python python/birdbrain_finalizer/test_db_writer.py
           python python/birdbrain_finalizer/test_udisc.py
+          python python/birdbrain_finalizer/test_udisc_import.py
 
   r-parse:
     runs-on: ubuntu-latest
