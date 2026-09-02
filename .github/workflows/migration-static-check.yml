@@ -26,6 +26,7 @@ jobs:
           python python/birdbrain_finalizer/test_db_writer.py
           python python/birdbrain_finalizer/test_udisc.py
           python python/birdbrain_finalizer/test_udisc_import.py
+          python python/birdbrain_finalizer/test_native_round_preview.py
 
   r-parse:
     runs-on: ubuntu-latest
