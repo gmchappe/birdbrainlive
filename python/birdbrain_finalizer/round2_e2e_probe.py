@@ -129,7 +129,10 @@ def resolve_players(cur, names: set[str]) -> dict[str, tuple[int, str]]:
 def seed_round1_baseline(cur, season_id: int, round1_id: int, round1, players) -> None:
     # Round 1 finalized under pre-SHAM rules. Its score-to-par adjustment is the
     # precise handicap basis for Round 2; the first-round applied handicap was 0.
-    cur.execute("SELECT par FROM layouts l JOIN rounds r ON r.layout_id=l.layout_id WHERE r.round_id=%s", (round1_id,))
+    cur.execute(
+        "SELECT par FROM layouts l JOIN rounds r ON r.layout_id=l.layout_id WHERE r.round_id=%s",
+        (round1_id,),
+    )
     par = cur.fetchone()[0]
     if par is None:
         raise RuntimeError("Round 1 template layout has no par.")
@@ -384,12 +387,12 @@ def main() -> None:
                     add_round2_only_memberships(cur, season_id, round2, players)
                     seed_postseason_opening_balance(cur, league_id, season_id, round1_id)
 
-                    _, layout_id, *_ = templates[2]
+                    layout_id = int(templates[2][0])
                     staged_participants, staged_scores = stage_udisc(
                         cur,
                         round_id=round2_id,
                         season_id=season_id,
-                        layout_id=int(layout_id),
+                        layout_id=layout_id,
                         parsed=round2,
                     )
                     insert_round2_playoff_resolutions(cur, round2_id)
