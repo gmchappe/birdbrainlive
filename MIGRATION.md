@@ -34,11 +34,19 @@ Completed:
 - Local PostgreSQL-backed Shiny smoke test passed under `birdbrain_shiny_reader` rather than the migration/admin role.
 - Separate `birdbrain-db-dev` app successfully deployed to Posit Connect Cloud with encrypted database environment variables.
 - Hosted `birdbrain-db-dev` UI was manually validated successfully, including reactive refresh behavior.
+- Transactional Round Finalizer core implemented in Python with regression coverage for payout, DNF/guest handling, ties, handicap trimming/bounds, ace accounting, SHAM calculations, and deterministic idempotency fingerprints.
+- Database finalization guard migration applied, including one native finalization receipt per round and deterministic finalizer ledger keys.
+- Full finalizer write path validated against the real development database with forced rollback and zero persistent residue.
+- UDisc XLSX parser and append-once persistent import boundary implemented with immutable import receipts, source/data fingerprints, audit events, and explicit no-overwrite behavior.
+- UDisc import receipt migration applied to the development database.
+- Persistent-import commit path validated inside an outer rollback, including preservation of pre-existing round ledger rows and identical-retry no-op behavior.
+- Round 2 regression fixture reproduced end to end from the real UDisc export through PostgreSQL: 35 participants, 630 hole scores, known paid order and payouts, $35 ace-pot balance, $523 postseason balance, and the two expected 45 course records.
+- Complete native persistent-path rehearsal passed: UDisc commit -> playoff resolution -> finalizer commit -> fixture reconciliation -> identical finalizer retry/no-op -> outer rollback, leaving no persistent database changes.
 
 Current phase:
 
-- Design and build transactional Round Finalizer writes against PostgreSQL.
-- Preserve the current validated read-only Connect Cloud app while write-path work is developed and tested separately.
+- Operationalize the first real future round on the development database using the guarded native workflow: UDisc preview, explicit import commit, results review, tie/ace resolution when needed, finalizer dry-run, and explicit finalization commit.
+- Preserve the validated read-only Connect Cloud app while operator controls are developed and tested separately.
 - Keep the current production shinyapps.io/Google-Sheets app unchanged until an explicit production cutover decision.
 
 ## Migration sequence
@@ -50,8 +58,23 @@ Current phase:
 5. Wire and validate the PostgreSQL-backed Shiny read path locally. **Complete.**
 6. Provision a least-privilege hosted Shiny database login and validate all six read contracts with it. **Complete.**
 7. Deploy a separate Connect Cloud development app with encrypted DB environment variables and validate it before any production read cutover. **Complete.**
-8. Build transactional Round Finalizer writes with regression coverage and failure-safe rollback semantics. **In progress.**
-9. Port calculation engines from R to Python incrementally, using the same PostgreSQL schema and regression fixtures.
+8. Build transactional UDisc import and Round Finalizer writes with regression coverage, idempotency receipts, and failure-safe rollback semantics. **Complete.**
+9. Operationalize and validate the native workflow against the first real future round in development. **In progress.**
+10. Port remaining R calculation/write workflows and application endpoints to Python incrementally, using the same PostgreSQL schema and regression fixtures.
+
+## Native round operator boundary
+
+The native database write path remains an administrator/development workflow until a separate authenticated API/UI is built.
+
+- UDisc import is append-once and defaults to rollback-only dry-run.
+- A persistent import requires an explicit `--commit --confirm IMPORT-R<round-no>` confirmation.
+- Import and finalization are intentionally separate irreversible actions; a committed import transitions the round to `results_review`.
+- Existing participant/score/result facts are never silently overwritten or merged by the importer.
+- An identical committed UDisc retry returns an idempotent no-op; a changed data fingerprint is rejected.
+- Round finalization defaults to rollback-only dry-run and only accepts a `results_review` round.
+- A persistent finalization requires an explicit `--commit --confirm FINALIZE-R<round-no>` confirmation.
+- An identical native finalization retry returns an `already-finalized` no-op; imported historical finalized rounds without native receipts cannot be replayed.
+- Production Shiny and the live Google Sheet are not part of this write path.
 
 ## Credentials
 
