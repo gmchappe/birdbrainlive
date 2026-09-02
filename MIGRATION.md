@@ -30,12 +30,14 @@ Completed:
 - Eleven incomplete Hall of Champions source rows are retained as documented historical gaps and are not fabricated into player records.
 - Local PostgreSQL-backed Shiny smoke test passed all six read contracts.
 - Local PostgreSQL-backed Shiny UI was manually validated against the current live app with no read-path or pool-lifecycle errors.
+- Least-privilege `birdbrain_shiny_reader` PostgreSQL login provisioned and verified against all six compatibility views; direct `players` table SELECT is denied.
+- Local PostgreSQL-backed Shiny smoke test passed under `birdbrain_shiny_reader` rather than the migration/admin role.
+- Separate `birdbrain-db-dev` app successfully deployed to Posit Connect Cloud with encrypted database environment variables.
 
 Current phase:
 
-- Provision the least-privilege `birdbrain_shiny_reader` PostgreSQL login.
-- Re-run the local smoke test using that reader rather than the migration/admin role.
-- Deploy `shiny-db/` as a separate BirdBrain DB development app on Posit Connect Cloud using encrypted environment variables.
+- Visually validate the hosted `birdbrain-db-dev` Connect Cloud app against the already-validated local DB-backed app.
+- Confirm reactive refreshes remain clean in the hosted runtime.
 - Keep the current production shinyapps.io/Google-Sheets app unchanged during hosted validation.
 
 ## Migration sequence
@@ -45,8 +47,8 @@ Current phase:
 3. Capture and load an immutable read-only snapshot of the current league workbook. **Complete.**
 4. Compare PostgreSQL compatibility views with the canonicalized staged outputs: schedule, leaderboard, current all-time, course records, aces, and hall of champions. **Complete.**
 5. Wire and validate the PostgreSQL-backed Shiny read path locally. **Complete.**
-6. Provision a least-privilege hosted Shiny database login and validate all six read contracts with it. **In progress.**
-7. Deploy a separate Connect Cloud development app with encrypted DB environment variables and validate it before any production read cutover.
+6. Provision a least-privilege hosted Shiny database login and validate all six read contracts with it. **Complete.**
+7. Deploy a separate Connect Cloud development app with encrypted DB environment variables and validate it before any production read cutover. **Deployed; hosted validation in progress.**
 8. Only after the DB-backed hosted Shiny read path is validated, build transactional Round Finalizer writes.
 9. Port calculation engines from R to Python incrementally, using the same PostgreSQL schema and regression fixtures.
 
