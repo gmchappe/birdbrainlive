@@ -21,7 +21,9 @@ jobs:
           python -m compileall -q python/birdbrain_migrate
           python -m compileall -q python/birdbrain_finalizer
       - name: Run round finalizer regressions
-        run: python python/birdbrain_finalizer/test_core.py
+        run: |
+          python python/birdbrain_finalizer/test_core.py
+          python python/birdbrain_finalizer/test_db_writer.py
 
   r-parse:
     runs-on: ubuntu-latest
